@@ -200,42 +200,57 @@ def register_account(ref_code, proxies, captcha_solver):
         return None, None, None
 
 def login_account(email, password, proxies, captcha_solver):
-    try:
-        log_message("Solving captcha for login...")
-        turnstile_token = captcha_solver.solve_turnstile()
-        if not turnstile_token:
-            return None, None
+    retry_count = 0
+    while retry_count < MAX_RETRIES:
+        try:
+            log_message("Solving captcha for login...")
+            turnstile_token = captcha_solver.solve_turnstile()
+            if not turnstile_token:
+                return None, None
+                
+            data = {
+                "email": email,
+                "password": password,
+                "turnstileToken": turnstile_token
+            }
             
-        data = {
-            "email": email,
-            "password": password,
-            "turnstileToken": turnstile_token
-        }
-        
-        log_message("Attempting login...")
-        response = requests.post(
-            'https://api.testnet.liqfinity.com/v1/auth/login',
-            headers=get_headers(),
-            json=data,
-            proxies=proxies,
-            impersonate="chrome110",
-            timeout=120,
-            verify=False
-        )
-        
-        if response.status_code == 200:
-            resp_json = response.json()
-            if resp_json.get('message') == 'Login successful':
-                log_message(f"Login successful for {email}", Fore.LIGHTGREEN_EX)
-                return resp_json['data']['accessToken'], resp_json['data']['refreshToken']
-        elif response.status_code in [502, 503, 504]:
-            log_message(f"Server error ({response.status_code}), skipping login. Try login and setup manually", Fore.LIGHTYELLOW_EX)
-            return None, None
-        log_message(f"Login failed with status {response.status_code}", Fore.LIGHTRED_EX)
-        return None, None
-    except Exception as e:
-        log_message(f"Login failed: {str(e)}", Fore.LIGHTRED_EX)
-        return None, None
+            log_message("Attempting login...")
+            response = requests.post(
+                'https://api.testnet.liqfinity.com/v1/auth/login',
+                headers=get_headers(),
+                json=data,
+                proxies=proxies,
+                impersonate="chrome110",
+                timeout=120,
+                verify=False
+            )
+            
+            if response.status_code == 200:
+                resp_json = response.json()
+                if resp_json.get('message') == 'Login successful':
+                    log_message(f"Login successful for {email}", Fore.LIGHTGREEN_EX)
+                    return resp_json['data']['accessToken'], resp_json['data']['refreshToken']
+            elif response.status_code in [502, 503, 504]:
+                retry_count += 1
+                if retry_count < MAX_RETRIES:
+                    log_message(f"Server error ({response.status_code}), retrying login... ({retry_count}/{MAX_RETRIES})", Fore.LIGHTYELLOW_EX)
+                    continue
+                else:
+                    log_message("Maximum login retries reached", Fore.LIGHTRED_EX)
+                    return None, None
+            else:
+                log_message(f"Login failed with status {response.status_code}", Fore.LIGHTRED_EX)
+                return None, None
+        except Exception as e:
+            retry_count += 1
+            if retry_count < MAX_RETRIES:
+                log_message(f"Login error: {str(e)}. Retrying... ({retry_count}/{MAX_RETRIES})", Fore.LIGHTYELLOW_EX)
+                continue
+            else:
+                log_message(f"Login failed after {MAX_RETRIES} attempts: {str(e)}", Fore.LIGHTRED_EX)
+                return None, None
+    
+    return None, None
 
 def setup_account(access_token, proxies, email):
     if not access_token:
