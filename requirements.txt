@@ -3,5 +3,4 @@ colorama
 fake-useragent
 curl-cffi
 2captcha-python
-twocaptcha
 anticaptchaofficial
