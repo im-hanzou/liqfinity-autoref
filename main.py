@@ -5,6 +5,7 @@ import os
 import json
 from fake_useragent import UserAgent
 from curl_cffi import requests
+from curl_cffi.requests.errors import RequestsError, CurlError
 from datetime import datetime
 from colorama import init, Fore, Style
 import time
@@ -23,6 +24,23 @@ def log_message(message, color=Fore.LIGHTCYAN_EX, show_progress=True):
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     progress = f" [{CURRENT_ACCOUNT}/{TOTAL_ACCOUNTS}]" if show_progress and TOTAL_ACCOUNTS > 0 else ""
     print(f"{Fore.WHITE}[{Fore.LIGHTBLACK_EX}{timestamp}{Fore.WHITE}]{progress} {color}{message}{Style.RESET_ALL}")
+
+def make_request_with_retry(request_func, max_retries=MAX_RETRIES):
+    retry_count = 0
+    while retry_count < max_retries:
+        try:
+            return request_func()
+        except Exception as e:
+            error_str = str(e)
+            if "Failed to perform" in error_str and "curl" in error_str:
+                retry_count += 1
+                if retry_count < max_retries:
+                    delay = random.uniform(1, 5)  
+                    log_message(f"Curl perform error, retrying... ", Fore.LIGHTYELLOW_EX)
+                    time.sleep(delay)
+                    continue
+            raise  
+    return None
 
 class CaptchaSolver:
     def __init__(self, api_key, solver_type="2captcha"):
@@ -111,35 +129,36 @@ def get_random_domain(proxies):
     consonants = 'bcdfghjklmnpqrstvwxyz'
     keyword = random.choice(consonants) + random.choice(vowels)
     
-    retry_count = 0
-    while retry_count < MAX_RETRIES:
-        try:
-            response = requests.get(
-                f'https://generator.email/search.php?key={keyword}',
-                headers=get_headers(),
-                proxies=proxies,
-                impersonate="chrome110",
-                timeout=120,
-                verify=False
-            )
-            domains = response.json()
-            valid_domains = [d for d in domains if all(ord(c) < 128 for c in d)]
-            
-            if valid_domains:
-                selected_domain = random.choice(valid_domains)
-                log_message(f"Selected domain: {selected_domain}", Fore.LIGHTGREEN_EX)
-                return selected_domain
-                
-            log_message("Could not find valid domain", Fore.LIGHTRED_EX)
+    def make_domain_request():
+        return requests.get(
+            f'https://generator.email/search.php?key={keyword}',
+            headers=get_headers(),
+            proxies=proxies,
+            impersonate="chrome110",
+            timeout=120,
+            verify=False
+        )
+    
+    try:
+        response = make_request_with_retry(make_domain_request)
+        if not response:
+            log_message("Failed to get domain after maximum retries", Fore.LIGHTRED_EX)
             return None
             
-        except Exception as e:
-            retry_count += 1
-            if retry_count < MAX_RETRIES:
-                log_message(f"Connection error: {str(e)}. Retrying... ({retry_count}/{MAX_RETRIES})", Fore.LIGHTYELLOW_EX)
-            else:
-                log_message(f"Error getting domain after {MAX_RETRIES} attempts: {str(e)}", Fore.LIGHTRED_EX)
-                return None
+        domains = response.json()
+        valid_domains = [d for d in domains if all(ord(c) < 128 for c in d)]
+        
+        if valid_domains:
+            selected_domain = random.choice(valid_domains)
+            log_message(f"Selected domain: {selected_domain}", Fore.LIGHTGREEN_EX)
+            return selected_domain
+            
+        log_message("Could not find valid domain", Fore.LIGHTRED_EX)
+        return None
+            
+    except Exception as e:
+        log_message(f"Error getting domain: {str(e)}", Fore.LIGHTRED_EX)
+        return None
 
 def generate_email(domain):
     log_message("Generating email address...")
@@ -153,29 +172,14 @@ def generate_email(domain):
     return email
 
 def register_account(ref_code, proxies, captcha_solver):
-    try:
-        domain = get_random_domain(proxies)
-        if not domain:
-            log_message("Failed to get valid domain", Fore.LIGHTRED_EX)
-            return None, None, None
-            
-        email = generate_email(domain)
-        password = generate_password()
-        
-        log_message("Solving captcha for registration...")
-        turnstile_token = captcha_solver.solve_turnstile()
-        if not turnstile_token:
-            return None, None, None
-            
+    def make_register_request(email, password, turnstile_token):
         data = {
             "password": password,
             "email": email,
             "referrerCode": ref_code,
             "turnstileToken": turnstile_token
         }
-        
-        log_message("Attempting registration...")
-        response = requests.post(
+        return requests.post(
             'https://api.testnet.liqfinity.com/v1/auth/register',
             headers=get_headers(),
             json=data,
@@ -184,56 +188,97 @@ def register_account(ref_code, proxies, captcha_solver):
             timeout=120,
             verify=False
         )
-        
-        if response.status_code == 200:
-            resp_json = response.json()
-            if resp_json.get('message') == 'Signup successfull':
-                log_message(f"Registration successful for {email}", Fore.LIGHTGREEN_EX)
-                return email, password, resp_json['data']['user']['referrerCode']
-        elif response.status_code in [502, 503, 504]:
-            log_message(f"Server error ({response.status_code}), Account might already be registered", Fore.LIGHTYELLOW_EX)
-            return email, password, "UNKNOWN"
-        log_message(f"Registration failed with status {response.status_code}", Fore.LIGHTRED_EX)
-        return None, None, None
-    except Exception as e:
-        log_message(f"Registration failed: {str(e)}", Fore.LIGHTRED_EX)
-        return None, None, None
 
-def login_account(email, password, proxies, captcha_solver):
     retry_count = 0
     while retry_count < MAX_RETRIES:
         try:
-            log_message("Solving captcha for login...")
+            domain = get_random_domain(proxies)
+            if not domain:
+                log_message("Failed to get valid domain", Fore.LIGHTRED_EX)
+                return None, None, None
+                
+            email = generate_email(domain)
+            password = generate_password()
+            log_message(f"Registering account with referral code: {ref_code}...")
+            
+            turnstile_token = captcha_solver.solve_turnstile()
+            if not turnstile_token:
+                return None, None, None
+
+            response = make_request_with_retry(
+                lambda: make_register_request(email, password, turnstile_token)
+            )
+            
+            if not response:
+                log_message("Failed to register after maximum retries", Fore.LIGHTRED_EX)
+                return None, None, None
+            
+            if response.status_code == 200:
+                resp_json = response.json()
+                if resp_json.get('message') == 'Signup successfull':
+                    log_message(f"Registration successful for {email}", Fore.LIGHTGREEN_EX)
+                    return email, password, resp_json['data']['user']['referrerCode']
+            elif response.status_code in [429, 502, 503, 504]:
+                log_message(f"Server error ({response.status_code}), retrying registration...", Fore.LIGHTYELLOW_EX)
+                retry_count += 1
+                if retry_count < MAX_RETRIES:
+                    continue
+                else:
+                    log_message(f"Maximum registration retries reached", Fore.LIGHTRED_EX)
+                    return None, None, None
+            else:
+                log_message(f"Registration failed with status {response.status_code}", Fore.LIGHTRED_EX)                
+                return None, None, None
+                
+        except Exception as e:
+            retry_count += 1
+            if retry_count < MAX_RETRIES:
+                log_message(f"Registration failed: {str(e)}, retrying registration... ", Fore.LIGHTYELLOW_EX)
+                continue
+            else:
+                log_message(f"Maximum registration retries reached", Fore.LIGHTRED_EX)
+                return None, None, None
+            
+    return None, None, None
+
+def login_account(email, password, proxies, captcha_solver):
+    def make_login_request(token):
+        data = {
+            "email": email,
+            "password": password,
+            "turnstileToken": token
+        }
+        return requests.post(
+            'https://api.testnet.liqfinity.com/v1/auth/login',
+            headers=get_headers(),
+            json=data,
+            proxies=proxies,
+            impersonate="chrome110",
+            timeout=120,
+            verify=False
+        )
+    
+    retry_count = 0
+    while retry_count < MAX_RETRIES:
+        try:
+            log_message(f"Logging in account {email}...")
             turnstile_token = captcha_solver.solve_turnstile()
             if not turnstile_token:
                 return None, None
                 
-            data = {
-                "email": email,
-                "password": password,
-                "turnstileToken": turnstile_token
-            }
-            
-            log_message("Attempting login...")
-            response = requests.post(
-                'https://api.testnet.liqfinity.com/v1/auth/login',
-                headers=get_headers(),
-                json=data,
-                proxies=proxies,
-                impersonate="chrome110",
-                timeout=120,
-                verify=False
-            )
+            response = make_request_with_retry(lambda: make_login_request(turnstile_token))
+            if not response:
+                return None, None
             
             if response.status_code == 200:
                 resp_json = response.json()
                 if resp_json.get('message') == 'Login successful':
                     log_message(f"Login successful for {email}", Fore.LIGHTGREEN_EX)
                     return resp_json['data']['accessToken'], resp_json['data']['refreshToken']
-            elif response.status_code in [502, 503, 504]:
+            elif response.status_code in [429, 502, 503, 504]:
                 retry_count += 1
                 if retry_count < MAX_RETRIES:
-                    log_message(f"Server error ({response.status_code}), retrying login... ({retry_count}/{MAX_RETRIES})", Fore.LIGHTYELLOW_EX)
+                    log_message(f"Server error ({response.status_code}), retrying login... ", Fore.LIGHTYELLOW_EX)
                     continue
                 else:
                     log_message("Maximum login retries reached", Fore.LIGHTRED_EX)
@@ -244,7 +289,7 @@ def login_account(email, password, proxies, captcha_solver):
         except Exception as e:
             retry_count += 1
             if retry_count < MAX_RETRIES:
-                log_message(f"Login error: {str(e)}. Retrying... ({retry_count}/{MAX_RETRIES})", Fore.LIGHTYELLOW_EX)
+                log_message(f"Login error: {str(e)}. Retrying... ", Fore.LIGHTYELLOW_EX)
                 continue
             else:
                 log_message(f"Login failed after {MAX_RETRIES} attempts: {str(e)}", Fore.LIGHTRED_EX)
@@ -255,32 +300,37 @@ def login_account(email, password, proxies, captcha_solver):
 def setup_account(access_token, proxies, email):
     if not access_token:
         return False
-        
+    
+    def make_setup_request():
+        headers = get_headers()
+        headers['authorization'] = f'Bearer {access_token}'
+        return requests.post(
+            'https://api.testnet.liqfinity.com/v1/user/account/setup',
+            headers=headers,
+            proxies=proxies,
+            impersonate="chrome110",
+            timeout=120,
+            verify=False
+        )
+    
     retry_count = 0
     while retry_count < MAX_RETRIES:
         try:
-            headers = get_headers()
-            headers['authorization'] = f'Bearer {access_token}'
-            
             log_message(f"Setting up account {email}...")
-            response = requests.post(
-                'https://api.testnet.liqfinity.com/v1/user/account/setup',
-                headers=headers,
-                proxies=proxies,
-                impersonate="chrome110",
-                timeout=120,
-                verify=False
-            )
+            response = make_request_with_retry(make_setup_request)
+            if not response:
+                return False
             
             if response.status_code == 200:
                 resp_json = response.json()
                 if resp_json.get('message') == 'Account setup successfull':
                     log_message("Account setup successful", Fore.LIGHTGREEN_EX)
                     return True
-            elif response.status_code in [502, 503, 504]:
+            elif response.status_code in [429, 502, 503, 504]:
                 retry_count += 1
                 if retry_count < MAX_RETRIES:
-                    log_message(f"Server error ({response.status_code}), retrying setup... ({retry_count}/{MAX_RETRIES})", Fore.LIGHTYELLOW_EX)
+                    log_message(f"Server error ({response.status_code}), retrying setup... ", Fore.LIGHTYELLOW_EX)
+                    time.sleep(random.uniform(1, 3))
                     continue
                 else:
                     log_message("Maximum setup retries reached", Fore.LIGHTRED_EX)
@@ -303,7 +353,7 @@ def save_account(email, password, ref_code, access_token, refresh_token):
             f.write(f"Token: {access_token if access_token else 'null'}\n")
             f.write(f"Refresh Token: {refresh_token if refresh_token else 'null'}\n")
             f.write("-" * 50 + "\n")
-        log_message("Account saved to accounts.txt", Fore.LIGHTGREEN_EX)
+        log_message("Account saved to accounts.txt", Fore.LIGHTMAGENTA_EX)
     except Exception as e:
         log_message(f"Failed to save account: {str(e)}", Fore.LIGHTRED_EX)
 
@@ -318,19 +368,38 @@ def main():
 """
     print(banner)
     
-    ref_code = input(f"{Fore.LIGHTCYAN_EX}Enter referral code: {Style.RESET_ALL}").strip()
     while True:
-        print(f"\n{Fore.LIGHTCYAN_EX}Choose captcha solver:")
+        ref_code = input(f"{Fore.LIGHTCYAN_EX}Enter referral code: {Style.RESET_ALL}").strip()
+        if ref_code:
+            break
+        print(f"{Fore.LIGHTRED_EX}Referrer code cannot be empty{Style.RESET_ALL}")
+    while True:
+        print(f"{Fore.LIGHTCYAN_EX}Choose captcha solver:")
         print("1. 2captcha")
         print("2. Anti-Captcha")
         choice = input(f"{Fore.LIGHTCYAN_EX}Enter choice (1 or 2): {Style.RESET_ALL}")
         if choice in ['1', '2']:
             solver_type = "2captcha" if choice == '1' else "anticaptcha"
             break
-        log_message("Invalid choice. Please enter 1 or 2.", Fore.LIGHTRED_EX, False)
-    
-    api_key = input(f"{Fore.LIGHTCYAN_EX}Enter your {solver_type} API key: {Style.RESET_ALL}").strip()
-    TOTAL_ACCOUNTS = int(input(f"{Fore.LIGHTCYAN_EX}Enter how many accounts: {Style.RESET_ALL}"))
+        print(f"{Fore.LIGHTRED_EX}Invalid choice. Please enter 1 or 2.{Style.RESET_ALL}")
+    while True:
+        api_key = input(f"{Fore.LIGHTCYAN_EX}Enter your {solver_type} API key: {Style.RESET_ALL}").strip()
+        if api_key:
+            break
+        print(f"{Fore.LIGHTRED_EX}{solver_type} API key cannot be empty{Style.RESET_ALL}")
+    while True:
+        user_input = input(f"{Fore.LIGHTCYAN_EX}Enter how many accounts: {Style.RESET_ALL}")
+        if user_input.strip():
+            try:
+                TOTAL_ACCOUNTS = int(user_input)
+                if TOTAL_ACCOUNTS > 0:
+                    break
+                else:
+                    print(f"{Fore.LIGHTRED_EX}Total accounts cannot be zero or negative{Style.RESET_ALL}")
+            except ValueError:
+                print(f"{Fore.LIGHTRED_EX}Please enter a valid number{Style.RESET_ALL}")
+        else:
+            print(f"{Fore.LIGHTRED_EX}Input cannot be empty, please try again{Style.RESET_ALL}")
     
     proxy_manager = ProxyManager()
     captcha_solver = CaptchaSolver(api_key, solver_type)
@@ -363,9 +432,13 @@ def main():
         else:
             failed += 1
             
-    time.sleep(delay)
+        if i < TOTAL_ACCOUNTS - 1:  
+            delay = random.uniform(2, 7)
+            log_message(f"Delay before next account...", Fore.LIGHTBLUE_EX)
+            time.sleep(delay)
+            print("\n")
     
-    log_message("All Process Completed", show_progress=False)
+    log_message("\nAll Process Completed", show_progress=False)
     log_message(f"Total accounts: {TOTAL_ACCOUNTS}", show_progress=False)
     log_message(f"Successful: {successful}", Fore.LIGHTGREEN_EX, False)
     log_message(f"Failed: {failed}", Fore.LIGHTRED_EX, False)
