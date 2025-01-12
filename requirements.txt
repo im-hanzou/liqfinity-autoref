@@ -1,0 +1,6 @@
+names
+colorama
+fake-useragent
+curl-cffi
+twocaptcha
+anticaptchaofficial
