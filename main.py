@@ -277,7 +277,7 @@ def setup_account(access_token, proxies, email):
                 if resp_json.get('message') == 'Account setup successfull':
                     log_message("Account setup successful", Fore.LIGHTGREEN_EX)
                     return True
-            elif response.status_code in [502, 504]:
+            elif response.status_code in [502, 503, 504]:
                 retry_count += 1
                 if retry_count < MAX_RETRIES:
                     log_message(f"Server error ({response.status_code}), retrying setup... ({retry_count}/{MAX_RETRIES})", Fore.LIGHTYELLOW_EX)
